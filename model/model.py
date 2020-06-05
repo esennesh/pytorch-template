@@ -1,3 +1,5 @@
+import pyro
+import pyro.distributions as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from base import BaseModel
