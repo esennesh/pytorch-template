@@ -1,4 +1,5 @@
 import numpy as np
+from pyro.infer import SVI, JitTraceGraph_ELBO, TraceGraph_ELBO
 import torch
 from torchvision.utils import make_grid
 from base import BaseTrainer
@@ -10,7 +11,8 @@ class Trainer(BaseTrainer):
     Trainer class
     """
     def __init__(self, model, criterion, metric_ftns, optimizer, config, data_loader,
-                 valid_data_loader=None, lr_scheduler=None, len_epoch=None):
+                 valid_data_loader=None, lr_scheduler=None, len_epoch=None,
+                 num_particles=4, jit=False):
         super().__init__(model, criterion, metric_ftns, optimizer, config)
         self.config = config
         self.data_loader = data_loader
@@ -25,6 +27,8 @@ class Trainer(BaseTrainer):
         self.do_validation = self.valid_data_loader is not None
         self.lr_scheduler = lr_scheduler
         self.log_step = int(np.sqrt(data_loader.batch_size))
+        self.num_particles = num_particles
+        self.jit = jit
 
         self.train_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns], writer=self.writer)
         self.valid_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns], writer=self.writer)
@@ -36,21 +40,26 @@ class Trainer(BaseTrainer):
         :param epoch: Integer, current training epoch.
         :return: A log that contains average loss and metric in this epoch.
         """
+        if self.jit:
+            elbo = JitTraceGraph_ELBO(vectorize_particles=False,
+                                      num_particles=self.num_particles)
+        else:
+            elbo = TraceGraph_ELBO(vectorize_particles=False,
+                                   num_particles=self.num_particles)
+        svi = SVI(self.model.model, self.model.guide, self.optimizer, loss=elbo)
+
         self.model.train()
         self.train_metrics.reset()
         for batch_idx, (data, target) in enumerate(self.data_loader):
             data, target = data.to(self.device), target.to(self.device)
 
             self.optimizer.zero_grad()
-            output = self.model(data)
-            loss = self.criterion(output, target)
-            loss.backward()
-            self.optimizer.step()
+            loss = svi.step(observations=data)
 
             self.writer.set_step((epoch - 1) * self.len_epoch + batch_idx)
             self.train_metrics.update('loss', loss.item())
             for met in self.metric_ftns:
-                self.train_metrics.update(met.__name__, met(output, target))
+                self.train_metrics.update(met.__name__, met(target))
 
             if batch_idx % self.log_step == 0:
                 self.logger.debug('Train Epoch: {} {} Loss: {:.6f}'.format(
@@ -78,19 +87,25 @@ class Trainer(BaseTrainer):
         :param epoch: Integer, current training epoch.
         :return: A log that contains information about validation
         """
+        if self.jit:
+            elbo = JitTraceGraph_ELBO(vectorize_particles=False,
+                                      num_particles=self.num_particles)
+        else:
+            elbo = TraceGraph_ELBO(vectorize_particles=False,
+                                   num_particles=self.num_particles)
+        svi = SVI(self.model.model, self.model.guide, self.optimizer, loss=elbo)
+
         self.model.eval()
         self.valid_metrics.reset()
         with torch.no_grad():
             for batch_idx, (data, target) in enumerate(self.valid_data_loader):
                 data, target = data.to(self.device), target.to(self.device)
-
-                output = self.model(data)
-                loss = self.criterion(output, target)
+                loss = svi.evaluate_loss(observations=data)
 
                 self.writer.set_step((epoch - 1) * len(self.valid_data_loader) + batch_idx, 'valid')
                 self.valid_metrics.update('loss', loss.item())
                 for met in self.metric_ftns:
-                    self.valid_metrics.update(met.__name__, met(output, target))
+                    self.valid_metrics.update(met.__name__, met(target))
                 self.writer.add_image('input', make_grid(data.cpu(), nrow=8, normalize=True))
 
         # add histogram of model parameters to the tensorboard
